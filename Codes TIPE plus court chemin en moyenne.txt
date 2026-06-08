@@ -1,0 +1,379 @@
+import heapq       
+import random     
+import math        
+import osmnx as ox
+import networkx as nx
+import numpy as np
+import matplotlib.pyplot as plt
+
+ville= "Le Raincy, France"
+graphe=ox.graph_from_place (ville, network_type= "drive")
+
+# Liste des nœuds
+noeuds = list(graphe.nodes())
+couleurs = ['blue'] * len(noeuds)
+
+# Choisir noeud départ et arrivée
+n1 = noeuds[1]
+n2 = noeuds[150]
+index_n1 = noeuds.index(n1)
+index_n2 = noeuds.index(n2)
+couleurs[index_n1] = 'red'
+couleurs[index_n2] = 'green'
+
+ox.plot_graph(
+    graphe,
+    node_color=couleurs,   # liste de couleurs
+    node_size=50,
+    edge_color='gray',
+    bgcolor='white',
+    figsize=(10,10)
+)
+
+# Conversion du graphe en GeoData
+noeuds, arrêtes = ox.graph_to_gdfs(graphe)
+ox.settings.useful_tags_node = ['highway', 'street_count']
+ox.settings.useful_tags_way = ['highway', 'maxspeed', 'lanes', 'length', 'traffic_signals']
+graphe = ox.graph_from_place("Le Raincy, France", network_type="drive")
+feu_rouge_s = 45
+feu_rouge_h = feu_rouge_s / 3600  
+intersection_feu = {}
+
+for node, attributs in graphe.nodes(data=True):
+    if attributs.get('highway') == 'traffic_signals':
+        intersection_feu[node] = feu_rouge_h
+
+for u, v, k, attributs in graphe.edges(keys=True, data=True):
+    if attributs.get('traffic_signals') in ['yes', 'signal'] or attributs.get('highway') == 'traffic_signals':
+        intersection_feu[u] = feu_rouge_h
+
+def dijkstra_complete(graphe, n1, n2, longueur_max_km=5):
+    distances = {node: float('inf') for node in graphe.nodes()}
+    distances[n1] = 0
+    predecesseurs = {node: None for node in graphe.nodes()}
+    file_priorite = [(0, n1)]
+
+    while file_priorite:
+        distance_courante, noeud_courant = heapq.heappop(file_priorite)
+        if distance_courante > distances[noeud_courant]:
+            continue
+
+        for voisin in graphe.neighbors(noeud_courant):
+            data = graphe[noeud_courant][voisin][0]
+
+            length_km = data['length'] / 1000
+            if length_km > longueur_max_km:
+                continue
+
+            vitesse = 50 
+            if 'maxspeed' in data:
+                ms = data['maxspeed']
+                try:
+                    if isinstance(ms, list):
+                        vitesse = float(ms[0])
+                    elif isinstance(ms, str):
+                        vitesse = float(ms.split()[0])
+                    else:
+                        vitesse = float(ms)
+                except:
+                    vitesse = 50
+            elif 'highway' in data:
+                hw = data['highway']
+                if isinstance(hw, list):
+                    hw = hw[0]
+                if hw in ['residential', 'living_street']:
+                    vitesse = 30
+                elif hw in ['primary', 'secondary', 'tertiary']:
+                    vitesse = 50
+                elif hw in ['motorway']:
+                    vitesse = 90
+                else:
+                    vitesse = 40
+
+            # Le poids dépend uniquement du temps de trajet (les feux sont ignorés)
+            poids = (length_km / vitesse)
+
+            distance = distance_courante + poids
+            if distance < distances[voisin]:
+                distances[voisin] = distance
+                predecesseurs[voisin] = noeud_courant
+                heapq.heappush(file_priorite, (distance, voisin))
+
+    chemin = []
+    noeud = n2
+    while noeud is not None:
+        chemin.append(noeud)
+        noeud = predecesseurs[noeud]
+    chemin.reverse()
+    return chemin, distances[n2]
+
+chemin, temps_minimal = dijkstra_complete(graphe, n1, n2)
+print("Chemin (nœuds) :", chemin)
+print("Temps minimal (minutes) :", temps_minimal*60)
+
+
+def vitesse_greenshields(data, densite):
+    hw = data.get('highway', 'residential')
+    if isinstance(hw, list):
+        hw = hw[0]
+
+    if hw in ['residential', 'living_street']:
+        vitesse_max = 30
+    elif hw in ['primary', 'secondary', 'tertiary']:
+        vitesse_max = 50
+    else:
+        vitesse_max = 40
+
+    nb_voies = data.get('lanes', 1)
+
+    try:
+        if isinstance(nb_voies, list):
+            nb_voies = int(nb_voies[0])
+        else:
+           nb_voies = int(nb_voies)
+    except:
+       nb_voies = 1
+    longueur_km = data['length'] / 1000
+    densite_max = (longueur_km / 2) * nb_voies
+
+    vitesse = vitesse_max * (1 - densite / densite_max)
+    if vitesse < 1:
+        vitesse = 1
+
+    return vitesse, densite_max
+
+def generer_500_plus_courts_chemins_statique(graphe, n1, n2, k, longueur_max_km=5):
+
+    if graphe.is_multigraph():
+        graphe_simple = nx.DiGraph()
+        for u, v, key, data in graphe.edges(keys=True, data=True):
+            length = data.get('length', 1.0)
+            if not graphe_simple.has_edge(u, v) or length < graphe_simple[u][v]['length']:
+                graphe_simple.add_edge(u, v, **data)
+    else:
+        graphe_simple = graphe
+    def poid_arete(u, v, d):
+        return d.get('length', 1.0)
+
+    chemins_trouves = []
+    try:
+        generateur_chemins = nx.shortest_simple_paths(graphe_simple, n1, n2, weight=poid_arete)
+        
+        for chemin in generateur_chemins:
+            if len(chemins_trouves) >= k:
+                break
+                
+            temps_cumule_heures = 0.0
+            chemin_valide = True
+            
+            for i in range(len(chemin) - 1):
+                u, v = chemin[i], chemin[i+1]
+                
+                try:
+                    if graphe.is_multigraph():
+                        data = graphe[u][v][0]
+                    else:
+                        data = graphe[u][v]
+                except KeyError:
+                    chemin_valide = False
+                    break
+                    
+                length_km = data.get('length', 0) / 1000
+                if length_km > longueur_max_km or length_km <= 0:
+                    chemin_valide = False
+                    break
+                    
+                vitesse, _ = vitesse_greenshields(data, 0.0)
+                temps_trajet = length_km / vitesse
+                penalite_feu = intersection_feu.get(u, 0)
+                
+                temps_cumule_heures += (temps_trajet + penalite_feu)
+                
+            if chemin_valide:
+                chemins_trouves.append((chemin, temps_cumule_heures * 60))
+                
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return []
+        
+    chemins_trouves.sort(key=lambda x: x[1])
+    return chemins_trouves
+
+def simuler_saa_500_chemins2(graphe, n1, n2, num_scenarios_Q=100, nb_voitures_IA_N=300, k_chemins=500, proba_barrage=0.02, dt=5/3600):
+
+    top_k_statique = generer_500_plus_courts_chemins_statique(graphe, n1, n2, k=k_chemins)
+    if not top_k_statique:
+        print("Erreur : Aucun chemin trouvé entre n1 et n2.")
+        return None
+
+    catalogues_chemins_A_B = [c[0] for c in top_k_statique]
+    num_chemins_reels = len(catalogues_chemins_A_B)
+
+    matrice_saa_temps = np.zeros((num_chemins_reels, num_scenarios_Q))
+    toutes_les_aretes = list(graphe.edges(keys=False))
+    tous_les_noeuds = list(graphe.nodes())
+
+    for q in range(num_scenarios_Q):
+        if (q + 1) % 10 == 0 or q == 0:
+            print(f"Scénario {q + 1}/{num_scenarios_Q}")
+        
+        # --- A. Tirage des routes barrées ---
+        routes_barrees = set()
+        nb_barrages = np.random.randint(2, 6)
+        if nb_barrages > 0:
+            indices_pannes = np.random.choice(len(toutes_les_aretes), size=nb_barrages, replace=False)
+            for idx in indices_pannes:
+                u, v = toutes_les_aretes[idx]
+                routes_barrees.add((u, v))
+                routes_barrees.add((v, u))
+
+        # --- B. Génération des trajectoires des N voitures IA ---
+        trajectoires_ia_fond = []
+        for i in range(nb_voitures_IA_N):
+            o_ia = np.random.choice(tous_les_noeuds)
+            d_ia = np.random.choice(tous_les_noeuds)
+            if o_ia != d_ia:
+                try:
+                    chemin_ia, _ = dijkstra_complete(graphe, o_ia, d_ia)
+                    aretes_ia = [(chemin_ia[j], chemin_ia[j+1]) for j in range(len(chemin_ia)-1)]
+                    trajectoires_ia_fond.append(aretes_ia)
+                except:
+                    continue
+
+        # --- C. Evaluation des chemins ---
+        cache_deviations_scenario = {}
+
+        for c_idx, chemin_test in enumerate(catalogues_chemins_A_B):
+            vehicules_actifs = []
+            aretes_cobaye = [(chemin_test[j], chemin_test[j+1]) for j in range(len(chemin_test)-1)]
+            vehicules_actifs.append({
+                'id': 'cobaye', 'type': 'cobaye', 'routes': list(aretes_cobaye),
+                'temps_accumule': 0.0, 'progression_arete': 0.0
+            })
+            
+            for idx_fond, traj in enumerate(trajectoires_ia_fond):
+                if traj:
+                    vehicules_actifs.append({
+                        'id': f"ia_{idx_fond}", 'type': 'decor', 'routes': list(traj),
+                        'temps_accumule': 0.0, 'progression_arete': 0.0
+                    })
+
+            # --- INITIALISATION DES DENSITÉS ---
+            densites_arcs = {arete: 0.0 for arete in toutes_les_aretes}
+
+            limite_ticks = 1500
+            ticks = 0
+            cobaye_arrive = False
+            
+            while len(vehicules_actifs) > 0 and ticks < limite_ticks and not cobaye_arrive:
+                ticks += 1
+                
+                # CORRECTION : Dictionnaire pour recenser la présence des véhicules à ce tick
+                voitures_par_arete = {arete: 0 for arete in toutes_les_aretes}
+
+                # 1. Calcul des vitesses courantes basées sur la densité du tick PRÉCÉDENT
+                vitesses_courantes = {}
+                for arete in toutes_les_aretes:
+                    u, v_node = arete
+                    data = graphe[u][v_node][0]
+                    vitesse_eff, _ = vitesse_greenshields(data, densites_arcs[arete])
+                    vitesses_courantes[arete] = max(vitesse_eff, 10.0) # Borne min 10 km/h
+
+                prochains_vehicules = []
+                
+                # 2. Déplacement des véhicules et mise en mémoire de leur position
+                for v in vehicules_actifs:
+                    if not v['routes']:
+                        if v['type'] == 'cobaye' and not cobaye_arrive:
+                            matrice_saa_temps[c_idx, q] = v['temps_accumule'] * 60
+                            cobaye_arrive = True
+                        continue
+                        
+                    arete_actuelle = v['routes'][0]
+                    if arete_actuelle not in vitesses_courantes:
+                        arete_actuelle = (arete_actuelle[1], arete_actuelle[0])
+                        
+                    # On enregistre que le véhicule occupe cette arête pendant ce pas de temps
+                    if arete_actuelle in voitures_par_arete:
+                        voitures_par_arete[arete_actuelle] += 1
+                        
+                    u, _v = arete_actuelle
+                    vitesse = vitesses_courantes.get(arete_actuelle, 30.0)
+                    longueur_km = graphe[u][_v][0]['length'] / 1000
+                    
+                    # Avancement du véhicule
+                    v['progression_arete'] += vitesse * dt
+                    v['temps_accumule'] += dt
+
+                    # Le véhicule change-t-il d'arête ?
+                    if v['progression_arete'] >= longueur_km:
+                        v['routes'].pop(0)
+                        v['progression_arete'] = 0.0
+                        
+                        if len(v['routes']) > 0:
+                            suivante = v['routes'][0]
+                            if suivante not in vitesses_courantes:
+                                suivante = (suivante[1], suivante[0])
+                            
+                            # Gestion des barrages aléatoires
+                            if suivante in routes_barrees:
+                                noeud_blocage = suivante[0]
+                                dest_finale = n2 if v['type'] == 'cobaye' else v['routes'][-1][1]
+                                cle_cache = (noeud_blocage, dest_finale)
+                                
+                                if cle_cache in cache_deviations_scenario:
+                                    v['routes'] = cache_deviations_scenario[cle_cache]
+                                else:
+                                    try:
+                                        deviation, _ = dijkstra_complete(graphe, noeud_blocage, dest_finale)
+                                        v['routes'] = [(deviation[j], deviation[j+1]) for j in range(len(deviation)-1)]
+                                    except:
+                                        v['routes'] = []
+                                    cache_deviations_scenario[cle_cache] = v['routes']
+                            
+                            if v['routes']:
+                                prochains_vehicules.append(v)
+                            elif v['type'] == 'cobaye':
+                                matrice_saa_temps[c_idx, q] = v['temps_accumule'] * 60
+                                cobaye_arrive = True
+                        else:
+                            if v['type'] == 'cobaye':
+                                matrice_saa_temps[c_idx, q] = v['temps_accumule'] * 60
+                                cobaye_arrive = True
+                    else:
+                        prochains_vehicules.append(v)
+                
+                vehicules_actifs = prochains_vehicules
+
+                # 3. === CORRECTION DE LA FORMULE HYDRODYNAMIQUE (LWR) ===
+                for arete in toutes_les_aretes:
+                    u, v_node = arete
+                    longueur_km = graphe[u][v_node][0]['length'] / 1000
+                    
+                    # Recalcul de la densité réelle (en véh/km) pour le pas de temps suivant
+                    densites_arcs[arete] = voitures_par_arete[arete] / longueur_km
+                        
+            if not cobaye_arrive:
+                matrice_saa_temps[c_idx, q] = (ticks * dt) * 60
+
+    # --- D. Post-Traitement SAA ---
+    esperances_chemins = np.mean(matrice_saa_temps, axis=1)
+    index_optimal_saa = np.argmin(esperances_chemins)
+    
+    return {
+        "index_chemin_robuste": index_optimal_saa,
+        "noeuds_chemin_robuste": catalogues_chemins_A_B[index_optimal_saa],
+        "temps_moyen_robuste": esperances_chemins[index_optimal_saa],
+        "toutes_les_moyennes": esperances_chemins,
+        "catalogue_complet": catalogues_chemins_A_B
+    }
+
+resultat_saa = simuler_saa_500_chemins2(
+    graphe=graphe, 
+    n1=n1, 
+    n2=n2,
+    num_scenarios_Q=1500,     # Échantillon statistique de scénarios
+    nb_voitures_IA_N=500,    # Trafic de fond (modèle Greenshields)
+    k_chemins=20,           # Nombre d'itinéraires candidats
+    proba_barrage=0.02, 
+    dt=5/3600                # Pas de temps de 5 secondes
+)
